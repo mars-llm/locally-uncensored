@@ -19,6 +19,7 @@
  *
  * Lauf: npx vitest run src/api/mcp/__tests__/der-kill-weg-nimmt-den-baum.test.ts
  */
+import { DISCOVERY } from './discovery-fixture'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -111,18 +112,18 @@ const config: MCPServerConfig = {
 }
 
 const goodServer: Responder = (req) => {
-  if (req.method === 'initialize') {
-    return JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: '2024-11-05' } })
+  if (req.method === 'server/discover') {
+    return JSON.stringify({ jsonrpc: '2.0', id: req.id, result: DISCOVERY })
   }
   if (req.method === 'tools/list') {
-    return JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { tools: [] } })
+    return JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { resultType: 'complete', ttlMs: 0, cacheScope: 'private', tools: [] } })
   }
   return null
 }
 
 /** Ein Server, der den Handshake verweigert — der zweite Kill-Weg. */
 const refusingServer: Responder = (req) => {
-  if (req.method === 'initialize') {
+  if (req.method === 'server/discover' || req.method === 'initialize') {
     return JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32000, message: 'nope' } })
   }
   return null

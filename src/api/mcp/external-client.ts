@@ -6,80 +6,15 @@
  */
 
 import type { Child } from '@tauri-apps/plugin-shell'
+import type { Client } from '@modelcontextprotocol/client'
+import type { TauriStdioTransport } from './tauri-stdio-transport'
 import type { MCPToolDefinition, MCPServerConfig, ToolArgs } from './types'
 import { log } from '../../lib/logger'
 import { APP_VERSION } from '../../lib/app-version'
 // Store-free on purpose: main.tsx reaches this module before the onboarding
 // handover (api/in-tauri.ts).
 import { isTauri } from '../in-tauri'
-import { isRecord, prop, asString, asNumber, asRecordArray, errorText } from '../../types/json-guards'
-
-// ── JSON-RPC message types ──────────────────────────────────────
-//
-// Everything arriving on stdout was written by a THIRD-PARTY process. The
-// request side we build ourselves and can type exactly; the response side is
-// `unknown` until `parseJsonRpcResponse` below has looked at it.
-
-interface JsonRpcRequest {
-  jsonrpc: '2.0'
-  id: number
-  method: string
-  params?: unknown
-}
-
-interface JsonRpcResponse {
-  jsonrpc: '2.0'
-  /** Absent on a notification — the server may talk without being asked. */
-  id?: number
-  result?: unknown
-  error?: { code: number; message: string; data?: unknown }
-}
-
-/**
- * Human-readable text for whatever a server put in `error`.
- *
- * The spec says an object with a `message`; real servers also send a bare
- * string, and one sends a number. Since this text is the ONLY thing the user
- * ever learns about the failure, a non-conforming value is rendered rather
- * than discarded — that is strictly better than the `Error: undefined` the
- * pre-typing code produced for exactly these lines.
- */
-function jsonRpcErrorMessage(raw: unknown): string {
-  if (isRecord(raw)) {
-    const msg = asString(raw.message)
-    if (msg) return msg
-  }
-  return errorText(raw) || 'MCP server reported an error'
-}
-
-/**
- * Narrow one parsed stdout line to a JSON-RPC response, or give up.
- *
- * Only the fields this client actually reads are required to be well-formed:
- * an `id` that can address a pending request, and an `error` — which is
- * honoured whenever it is PRESENT, whatever its shape. That is the load-bearing
- * rule here: a server that answers `"error": "boom"` has failed, and treating
- * the line as anything but a rejection would resolve the pending request with
- * `undefined` and tell the model the tool ran. Only `undefined`/`null` — i.e.
- * no error at all — is a success.
- *
- * Anything that is not a record, or carries no usable `id`, is a notification
- * or noise and is ignored.
- */
-function parseJsonRpcResponse(v: unknown): JsonRpcResponse | null {
-  if (!isRecord(v)) return null
-  const id = asNumber(v.id)
-  const rawError = v.error
-  let error: JsonRpcResponse['error']
-  if (rawError != null) {
-    error = {
-      code: (isRecord(rawError) ? asNumber(rawError.code) : undefined) ?? 0,
-      message: jsonRpcErrorMessage(rawError),
-      data: isRecord(rawError) ? rawError.data : rawError,
-    }
-  }
-  return { jsonrpc: '2.0', id, result: v.result, error }
-}
+import { isRecord, prop, asString, asRecordArray, errorText } from '../../types/json-guards'
 
 /**
  * Does this look like the JSON-Schema object a tool's `inputSchema` must be?
@@ -205,14 +140,10 @@ export class MCPExternalClient {
    * (reading 'write')".
    */
   private child: Child | null = null
-  private requestId = 0
-  private pendingRequests = new Map<number, {
-    resolve: (value: unknown) => void
-    reject: (error: Error) => void
-    timer: ReturnType<typeof setTimeout>
-  }>()
-  private outputBuffer = ''
+  private client: Client | null = null
+  private transport: TauriStdioTransport | null = null
   private connected = false
+  private connecting = false
   /** True while OUR disconnect() is taking the process down, so the close
    *  handler can tell a deliberate shutdown from a server that died. */
   private closingOnPurpose = false
@@ -251,12 +182,26 @@ export class MCPExternalClient {
   }
 
   async connect(): Promise<MCPToolDefinition[]> {
+    if (this.child || this.connecting) throw new Error('Already connected or connecting')
+    this.connecting = true
+    this.closingOnPurpose = false
+    this.registered = false
+    this.lastOutputAt = 0
     try {
-      // Lazy so the plugin only loads once a server connects, but vite must
-      // resolve and bundle it: with @vite-ignore the packaged WebView gets a
-      // bare specifier and every connect dies on the import itself (D#90).
-      const shellModule = await import('@tauri-apps/plugin-shell')
-      const { Command } = shellModule
+      // Keep the SDK and shell lazy: this module also loads before onboarding.
+      const [{ Client }, { TauriStdioTransport }, { Command }] = await Promise.all([
+        import('@modelcontextprotocol/client'),
+        import('./tauri-stdio-transport'),
+        import('@tauri-apps/plugin-shell'),
+      ])
+      const transport = new TauriStdioTransport(
+        async (message) => {
+          if (!this.child) throw new Error('Not connected')
+          await this.child.write(message)
+        },
+        () => this.killServerProcess(),
+      )
+      this.transport = transport
 
       // Windows gotcha: npm-family launchers exist only as `.cmd` shims
       // (npx.cmd) while node/deno/bun ship a real .exe, and tools like pnpm
@@ -286,23 +231,24 @@ export class MCPExternalClient {
 
         // Handle stdout — parse JSON-RPC responses
         command.stdout.on('data', (data: string) => {
-          this.outputBuffer += data
-          this.processBuffer()
+          transport.receive(data)
         })
 
         command.stderr.on('data', (data: string) => {
+          if (this.transport !== transport) return
           log.warn(`[MCP:${this.config.name}] stderr`, { data })
           this.lastOutputAt = Date.now()
           if (!this.registered) this.onProgress?.(INSTALLING_NOTE)
         })
 
         command.on('close', () => {
+          if (this.transport !== transport) return
           const wasConnected = this.connected
           this.connected = false
           this.child = null
           // The process is gone: nothing left for a shutdown sweep to kill.
           liveClients.delete(this)
-          this.rejectAllPending('Server process exited')
+          transport.exited()
           // A crash, an OOM kill, a server that quits on a bad config: the
           // tools it registered are dead weight from this moment on, and the
           // only honest UI is one that says so.
@@ -327,21 +273,42 @@ export class MCPExternalClient {
       // removes it again if the handshake fails outright.
       liveClients.add(this)
 
-      // Initialize the MCP connection. It waits while the server still
-      // prints (HANDSHAKE_QUIET_MS); the server's own config may give it
-      // longer still (d307-k, 19.10.2026: REA's first start on a slow line).
+      // The official SDK negotiates discovery and attaches the current
+      // per-request metadata. Existing initialize-only servers are still
+      // handled by its auto mode; modern servers never need a downgrade.
       const quietMs = Math.max(this.config.initializeTimeoutMs ?? 0, HANDSHAKE_QUIET_MS)
       const capMs = Math.max(quietMs, HANDSHAKE_CAP_MS)
+      const controller = new AbortController()
       const startedAt = Date.now()
-      await this.sendRequest('initialize', {
-        protocolVersion: '2024-11-05',
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const deadline = new Promise<never>((_resolve, reject) => {
+        const expire = () => {
+          const more = handshakeWaitLeft(Date.now(), startedAt, this.lastOutputAt, quietMs, capMs)
+          if (more !== null) timer = setTimeout(expire, more)
+          else {
+            const error = new Error(`MCP handshake timed out (no answer and no progress for ${Math.round(quietMs / 60_000)} min)`)
+            controller.abort(error)
+            reject(error)
+          }
+        }
+        timer = setTimeout(expire, quietMs)
+      })
+      this.client = new Client({ name: 'locally-uncensored', version: APP_VERSION }, {
         capabilities: {},
-        clientInfo: { name: 'locally-uncensored', version: APP_VERSION },
-      }, quietMs, () => handshakeWaitLeft(Date.now(), startedAt, this.lastOutputAt, quietMs, capMs),
-      `no answer and no progress for ${Math.round(quietMs / 60_000)} min`)
+        versionNegotiation: { mode: 'auto', probe: { timeoutMs: capMs + 1 } },
+        inputRequired: { autoFulfill: false },
+      })
+      this.client.onerror = (err) => log.warn(`[MCP:${this.config.name}] protocol error`, { err: errorText(err) })
+      try {
+        await Promise.race([this.client.connect(this.transport, { signal: controller.signal, timeout: capMs + 1 }), deadline])
+      } catch (err) {
+        if (controller.signal.aborted) throw controller.signal.reason
+        throw err
+      } finally {
+        clearTimeout(timer)
+      }
 
-      // Discover tools
-      const toolsResult = await this.sendRequest('tools/list', {})
+      const toolsResult = await this.client.listTools({}, { timeout: REQUEST_TIMEOUT_MS })
       const tools: MCPToolDefinition[] = []
       for (const t of asRecordArray(prop(toolsResult, 'tools'))) {
         const toolName = asString(t.name)
@@ -372,16 +339,22 @@ export class MCPExternalClient {
       // A failure after spawn (handshake refused, tools/list timed out) leaves
       // the server process running with nobody holding a handle to it — the
       // caller never gets a client it could disconnect. Take it down here.
-      await this.killServerProcess()
+      await this.closeClient()
       liveClients.delete(this)
       throw new Error(`Failed to connect to MCP server "${this.config.name}": ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      this.connecting = false
     }
   }
 
   async callTool(name: string, args: ToolArgs): Promise<string> {
-    if (!this.connected) throw new Error('Not connected')
+    if (!this.connected || !this.client) throw new Error('Not connected')
 
-    const result = await this.sendRequest('tools/call', { name, arguments: args })
+    const result = await this.client.callTool({ name, arguments: args }, { timeout: REQUEST_TIMEOUT_MS })
+    if (result.isError) {
+      const text = result.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n')
+      throw new Error(text || 'MCP tool reported an error')
+    }
 
     // MCP returns a content array of `{ type, ... }` blocks.
     const content = prop(result, 'content')
@@ -404,8 +377,7 @@ export class MCPExternalClient {
     // Out of the shutdown sweep first: a disconnect that is itself running
     // inside the sweep must not be reachable a second time.
     liveClients.delete(this)
-    this.rejectAllPending('Disconnecting')
-    await this.killServerProcess()
+    await this.closeClient()
   }
 
   /**
@@ -490,95 +462,15 @@ export class MCPExternalClient {
     return this.connected
   }
 
-  // ── Private ─────────────────────────────────────────────────
-
-  /**
-   * `waitMore`, when given, is asked each time the wait runs out: a number is
-   * how much longer to wait, null ends the request with a timeout.
-   */
-  private sendRequest(
-    method: string,
-    params?: unknown,
-    timeoutMs: number = REQUEST_TIMEOUT_MS,
-    waitMore?: () => number | null,
-    timeoutWhy?: string,
-  ): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-      if (!this.child) {
-        reject(new Error('Not connected'))
-        return
-      }
-      const id = ++this.requestId
-      const request: JsonRpcRequest = {
-        jsonrpc: '2.0',
-        id,
-        method,
-        params,
-      }
-
-      const expire = () => {
-        const entry = this.pendingRequests.get(id)
-        if (!entry) return
-        const more = waitMore?.() ?? null
-        if (more !== null) {
-          entry.timer = setTimeout(expire, more)
-          return
-        }
-        this.pendingRequests.delete(id)
-        reject(new Error(`Request ${method} timed out${timeoutWhy ? ` (${timeoutWhy})` : ''}`))
-      }
-      const timer = setTimeout(expire, timeoutMs > 0 ? timeoutMs : REQUEST_TIMEOUT_MS)
-
-      this.pendingRequests.set(id, { resolve, reject, timer })
-
-      // Child.write is async: a failed write has to fail the request instead
-      // of becoming an unhandled rejection and letting it sit for 30 s.
-      const msg = JSON.stringify(request) + '\n'
-      Promise.resolve(this.child.write(msg)).catch((err: unknown) => {
-        const entry = this.pendingRequests.get(id)
-        if (entry && this.pendingRequests.delete(id)) {
-          clearTimeout(entry.timer)
-          reject(err instanceof Error ? err : new Error(String(err)))
-        }
-      })
-    })
-  }
-
-  private processBuffer() {
-    const lines = this.outputBuffer.split('\n')
-    this.outputBuffer = lines.pop() || ''
-
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed) continue
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(trimmed)
-      } catch {
-        // Not JSON — a server that logs to stdout, ignore.
-        continue
-      }
-      const response = parseJsonRpcResponse(parsed)
-      if (!response || response.id === undefined) continue // notification or noise
-      const pending = this.pendingRequests.get(response.id)
-      if (pending) {
-        this.pendingRequests.delete(response.id)
-        clearTimeout(pending.timer)
-        if (response.error) {
-          pending.reject(new Error(response.error.message))
-        } else {
-          pending.resolve(response.result)
-        }
-      }
-    }
-  }
-
-  private rejectAllPending(reason: string) {
-    const pending = [...this.pendingRequests.values()]
-    this.pendingRequests.clear()
-    for (const { reject, timer } of pending) {
-      clearTimeout(timer)
-      reject(new Error(reason))
+  private async closeClient(): Promise<void> {
+    const client = this.client
+    this.client = null
+    try {
+      await client?.close()
+    } finally {
+      // Also covers a spawn failure before the SDK owned the transport.
+      await this.transport?.close()
+      this.transport = null
     }
   }
 }

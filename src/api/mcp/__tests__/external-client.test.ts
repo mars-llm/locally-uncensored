@@ -9,6 +9,7 @@
  * "Cannot read properties of undefined (reading 'write')". The fake below
  * makes that a hard failure again: touching `stdin` throws.
  */
+import { DISCOVERY } from './discovery-fixture'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { MCPExternalClient, HANDSHAKE_CAP_MS, HANDSHAKE_QUIET_MS, INSTALLING_NOTE, handshakeWaitLeft } from '../external-client'
 import type { MCPServerConfig } from '../types'
@@ -104,21 +105,21 @@ const config: MCPServerConfig = {
 
 /** A well-behaved MCP server: handshake, one tool, echoing tools/call. */
 const goodServer: Responder = (req) => {
-  if (req.method === 'initialize') {
-    return JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: '2024-11-05' } })
+  if (req.method === 'server/discover') {
+    return JSON.stringify({ jsonrpc: '2.0', id: req.id, result: DISCOVERY })
   }
   if (req.method === 'tools/list') {
     return JSON.stringify({
       jsonrpc: '2.0',
       id: req.id,
-      result: { tools: [{ name: 'get_forecast', description: 'forecast', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } }] },
+      result: { resultType: 'complete', ttlMs: 0, cacheScope: 'private', tools: [{ name: 'get_forecast', description: 'forecast', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } }] },
     })
   }
   if (req.method === 'tools/call') {
     return JSON.stringify({
       jsonrpc: '2.0',
       id: req.id,
-      result: { content: [{ type: 'text', text: `sunny in ${String(req.params?.arguments?.city)}` }] },
+      result: { resultType: 'complete', content: [{ type: 'text', text: `sunny in ${String(req.params?.arguments?.city)}` }] },
     })
   }
   return null
@@ -159,7 +160,7 @@ describe('connecting to an external server', () => {
     try {
       let held: FakeRequest | null = null
       responder = (req) => {
-        if (req.method === 'initialize') { held = req; return null }
+        if (req.method === 'server/discover') { held = req; return null }
         return goodServer(req)
       }
       const client = new MCPExternalClient({ ...config, initializeTimeoutMs }, { onProgress: (n) => notes.push(n) })
@@ -174,7 +175,7 @@ describe('connecting to an external server', () => {
       } else {
         await vi.advanceTimersByTimeAsync(answerAfterMs)
       }
-      lastServer!.stdout.emit('data', JSON.stringify({ jsonrpc: '2.0', id: held!.id, result: { protocolVersion: '2024-11-05' } }) + '\n')
+      lastServer!.stdout.emit('data', JSON.stringify({ jsonrpc: '2.0', id: held!.id, result: DISCOVERY }) + '\n')
       await vi.advanceTimersByTimeAsync(1)
       return await done
     } finally {
@@ -194,7 +195,7 @@ describe('connecting to an external server', () => {
   })
 
   it('a server that stays quiet past the two minutes times out and says why', async () => {
-    expect(await slowHandshake(undefined, 121_000)).toMatch(/Request initialize timed out \(no answer and no progress for 2 min\)/)
+    expect(await slowHandshake(undefined, 121_000)).toMatch(/MCP handshake timed out \(no answer and no progress for 2 min\)/)
   })
 
   it('a server still printing download progress gets more time with every line', async () => {
@@ -207,7 +208,7 @@ describe('connecting to an external server', () => {
 
   it('even a server that keeps printing is given up at the ten-minute cap', async () => {
     expect(HANDSHAKE_CAP_MS).toBe(10 * 60_000)
-    expect(await slowHandshake(undefined, 11 * 60_000, 60_000)).toMatch(/Request initialize timed out/)
+    expect(await slowHandshake(undefined, 11 * 60_000, 60_000)).toMatch(/MCP handshake timed out/)
   })
 
   it('the wait left is the quiet window since the last line, never past the cap', () => {
@@ -234,7 +235,7 @@ describe('connecting to an external server', () => {
 
     expect(lastServer!.written).toHaveLength(2)
     for (const msg of lastServer!.written) expect(msg.endsWith('\n')).toBe(true)
-    expect(JSON.parse(lastServer!.written[0]).method).toBe('initialize')
+    expect(JSON.parse(lastServer!.written[0]).method).toBe('server/discover')
     expect(JSON.parse(lastServer!.written[1]).method).toBe('tools/list')
   })
 
@@ -295,7 +296,7 @@ describe('connecting to an external server', () => {
         jsonrpc: '2.0',
         id: req.id,
         error: null,
-        result: { content: [{ type: 'text', text: 'still fine' }] },
+        result: { resultType: 'complete', content: [{ type: 'text', text: 'still fine' }] },
       })
 
     expect(await client.callTool('get_forecast', { city: 'Berlin' })).toBe('still fine')
@@ -309,7 +310,7 @@ describe('connecting to an external server', () => {
 describe('a server that misbehaves does not leave a process behind', () => {
   it('kills the child when the handshake is refused', async () => {
     responder = (req) =>
-      req.method === 'initialize'
+      (req.method === 'server/discover' || req.method === 'initialize')
         ? JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32600, message: 'nope' } })
         : null
 
@@ -323,14 +324,14 @@ describe('a server that misbehaves does not leave a process behind', () => {
   })
 
   it('fails every pending request when the process exits', async () => {
-    responder = (req) => (req.method === 'initialize' ? JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }) : null)
+    responder = (req) => (req.method === 'server/discover' ? JSON.stringify({ jsonrpc: '2.0', id: req.id, result: DISCOVERY }) : null)
     const client = new MCPExternalClient(config)
     const connecting = client.connect()
     // tools/list gets no answer; the process dies instead.
     await wroteRequests(2)
     lastServer!.emit('close')
 
-    await expect(connecting).rejects.toThrow(/Server process exited/)
+    await expect(connecting).rejects.toThrow(/closed|exited/i)
     expect(client.isConnected()).toBe(false)
   })
 })
@@ -343,12 +344,13 @@ describe('response framing', () => {
     await wroteRequests(1)
     const server = lastServer!
     const id = JSON.parse(server.written[0]).id
-    server.stdout.emit('data', `{"jsonrpc":"2.0","id":${id},"resu`)
-    server.stdout.emit('data', 'lt":{"ok":true}}\n')
+    const wire = JSON.stringify({ jsonrpc: '2.0', id, result: DISCOVERY }) + '\n'
+    server.stdout.emit('data', wire.slice(0, 30))
+    server.stdout.emit('data', wire.slice(30))
     // The handshake resolved; tools/list is now outstanding, so answer it too.
     await wroteRequests(2)
     const listId = JSON.parse(server.written[1]).id
-    server.stdout.emit('data', `{"jsonrpc":"2.0","id":${listId},"result":{"tools":[]}}\n`)
+    server.stdout.emit('data', `{"jsonrpc":"2.0","id":${listId},"result":{"resultType":"complete","ttlMs":0,"cacheScope":"private","tools":[]}}\n`)
 
     await expect(connecting).resolves.toEqual([])
   })
@@ -395,11 +397,13 @@ describe('a server that dies on its own', () => {
     const client = new MCPExternalClient(config)
     await client.connect()
     responder = () => null                       // the server answers nothing
+    const count = lastServer!.written.length
     const call = client.callTool('get_forecast', { city: 'Berlin' })
+    await wroteRequests(count + 1)
 
     lastServer!.emit('close')
 
-    await expect(call).rejects.toThrow(/Server process exited/)
+    await expect(call).rejects.toThrow(/closed|exited/i)
   })
 
   it('NEGATIVE CONTROL: our own disconnect is not reported as a death', async () => {
@@ -439,5 +443,70 @@ describe('the settings panel is what acts on that', () => {
     expect(panel).toContain('toolRegistry.unregisterServer(id)')
     expect(panel).toContain('setConnected(id, false)')
     expect(panel).toContain('clearServerTools(id)')
+  })
+})
+
+describe('current MCP protocol', () => {
+  it('attaches the negotiated version to discovery, listing and calls, without initialize', async () => {
+    const client = new MCPExternalClient(config)
+    await client.connect()
+    await client.callTool('get_forecast', { city: 'Berlin' })
+    const requests = lastServer!.written.map((line) => JSON.parse(line))
+    expect(requests.map((r) => r.method)).toEqual(['server/discover', 'tools/list', 'tools/call'])
+    for (const r of requests) {
+      expect(r.params._meta['io.modelcontextprotocol/protocolVersion']).toBe('2026-07-28')
+      expect(r.params._meta['io.modelcontextprotocol/clientInfo'].name).toBe('locally-uncensored')
+    }
+    await client.disconnect()
+  })
+
+  it('surfaces a tool execution error instead of returning it as a success', async () => {
+    const client = new MCPExternalClient(config)
+    await client.connect()
+    responder = (req) => JSON.stringify({ jsonrpc: '2.0', id: req.id,
+      result: { resultType: 'complete', isError: true, content: [{ type: 'text', text: 'Wallet step refused' }] } })
+    await expect(client.callTool('get_forecast', {})).rejects.toThrow('Wallet step refused')
+    await client.disconnect()
+  })
+
+  it('still initializes a server that explicitly does not support discovery', async () => {
+    responder = (req) => {
+      if (req.method === 'server/discover') return JSON.stringify({ jsonrpc: '2.0', id: req.id,
+        error: { code: -32601, message: 'Method not found' } })
+      if (req.method === 'initialize') return JSON.stringify({ jsonrpc: '2.0', id: req.id,
+        result: { protocolVersion: '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'legacy-test', version: '1' } } })
+      return goodServer(req)
+    }
+    const client = new MCPExternalClient(config)
+    await expect(client.connect()).resolves.toHaveLength(1)
+    expect(lastServer!.written.map((line) => JSON.parse(line).method)).toEqual([
+      'server/discover', 'initialize', 'notifications/initialized', 'tools/list',
+    ])
+    await client.disconnect()
+  })
+})
+
+
+describe('connection ownership', () => {
+  it('does not spawn twice for concurrent connect calls', async () => {
+    responder = () => null
+    const client = new MCPExternalClient(config)
+    const connecting = client.connect().catch((error: unknown) => error)
+    await serverStarted()
+    await expect(client.connect()).rejects.toThrow('Already connected or connecting')
+    lastServer!.emit('close')
+    expect(await connecting).toBeInstanceOf(Error)
+  })
+
+  it('ignores a late close event from a previous connection', async () => {
+    const client = new MCPExternalClient(config)
+    await client.connect()
+    const old = lastServer!
+    await client.disconnect()
+    await client.connect()
+    old.emit('close')
+    expect(client.isConnected()).toBe(true)
+    expect(await client.callTool('get_forecast', { city: 'Berlin' })).toBe('sunny in Berlin')
+    await client.disconnect()
   })
 })

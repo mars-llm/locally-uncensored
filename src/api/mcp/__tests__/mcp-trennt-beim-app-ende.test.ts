@@ -14,6 +14,7 @@
  *
  * Lauf: npx vitest run src/api/mcp/__tests__/mcp-trennt-beim-app-ende.test.ts
  */
+import { DISCOVERY } from './discovery-fixture'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -92,14 +93,15 @@ vi.mock('@tauri-apps/plugin-shell', () => ({
 
 /** A well-behaved MCP server: handshake plus one tool. */
 function respond(req: FakeRequest): string | null {
-  if (req.method === 'initialize') {
-    return JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { protocolVersion: '2024-11-05' } })
+  if (req.method === 'server/discover') {
+    return JSON.stringify({ jsonrpc: '2.0', id: req.id, result: DISCOVERY })
   }
   if (req.method === 'tools/list') {
     return JSON.stringify({
       jsonrpc: '2.0',
       id: req.id,
       result: {
+        resultType: 'complete', ttlMs: 0, cacheScope: 'private',
         tools: [{
           name: 'get_forecast',
           description: 'forecast',
